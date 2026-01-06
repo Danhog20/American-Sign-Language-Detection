@@ -3,13 +3,24 @@ import csv
 import copy
 import argparse
 import itertools
+import time
 
 import cv2 as cv
 import numpy as np
 import mediapipe as mp
+import socket
 
 from utils.cvfpscalc import CvFpsCalc
 from model.keypoint_classifier.keypoint_classifier import KeyPointClassifier
+
+#using ESP32 cam for video capture using camwebserver example from library
+ESP32_IP = "192.168.10.166"  # ESP32 cam IP for cam
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+ESP32_UDP = ("192.168.10.166", 3333) # ESP32 UDP IP + UDP port
+STREAM_TIMEOUT = 2.0  # seconds without a frame
+STABLE_TIME = 0.7  # seconds gesture must stay stable
+NO_HAND_TIMEOUT = 1.5  # seconds with no visible hands before sending
+MAX_CHARS = 20  # Maximum characters before it force sends
 
 
 datasetdir = "model/dataset/dataset 1"
@@ -40,8 +51,29 @@ def get_args():
 
     return args
 
+def send_result_to_esp32(gesture_text): 
+    try:
+        sock.sendto(gesture_text.encode(), ESP32_UDP)# sends result to esp32 via UDP connection
+    except:
+        pass
+
+def open_stream():#takes the esp32 cam stream as visual input
+    cap = cv.VideoCapture(
+        f"http://{ESP32_IP}:81/stream",
+        cv.CAP_FFMPEG
+    )
+    cap.set(cv.CAP_PROP_BUFFERSIZE, 2)
+    return cap
 
 def main():
+    current_text = ""
+    stable_gesture = None
+    gesture_start_time = 0
+    gesture_committed = False
+    last_hand_time = time.time()
+    last_detected_gesture = None
+    last_sent_gesture = None
+    last_frame_time = time.time()
     # Argument parsing #################################################################
     args = get_args()
 
@@ -56,15 +88,14 @@ def main():
     use_brect = True
 
     # Camera preparation ###############################################################
-    cap = cv.VideoCapture(cap_device)
-    cap.set(cv.CAP_PROP_FRAME_WIDTH, cap_width)
-    cap.set(cv.CAP_PROP_FRAME_HEIGHT, cap_height)
+    cap = cv.VideoCapture(f"http://{ESP32_IP}:81/stream")
+    cap.set(cv.CAP_PROP_BUFFERSIZE, 1)
 
     # Model load #############################################################
     mp_hands = mp.solutions.hands
     hands = mp_hands.Hands(
         static_image_mode=use_static_image_mode,
-        max_num_hands=2,
+        max_num_hands=1,
         min_detection_confidence=min_detection_confidence,
         min_tracking_confidence=min_tracking_confidence,
     )
@@ -93,11 +124,23 @@ def main():
             break
         number, mode = select_mode(key, mode)
 
-        # Camera capture #####################################################
+        # Camera capture  #####################################################
         ret, image = cap.read()
-        if not ret:
-            break
-        image = cv.flip(image, 1)  # Mirror display
+        if ret:
+            last_frame_time = time.time()
+        else:
+            if time.time() - last_frame_time > STREAM_TIMEOUT:
+                print("🔥 MJPEG stalled — forcing hard reconnect")
+                cap.release()
+                cv.destroyAllWindows()
+                time.sleep(0.5)
+                cap = open_stream()
+                last_frame_time = time.time()
+                continue
+            else:
+                continue
+
+        image = cv.resize(image, (320, 240))  # image size might be too low will see if an increase is possible
         debug_image = copy.deepcopy(image)
 
         # Detection implementation #############################################################
@@ -176,36 +219,42 @@ def main():
             break
         else:
             if results.multi_hand_landmarks is not None:
+                now = time.time()
+                last_hand_time = now
                 for hand_landmarks, handedness in zip(
                     results.multi_hand_landmarks, results.multi_handedness
-                ):
-                    # Bounding box calculation
+                    ):
+                    
+                    # --- existing landmark + classification code ---
                     brect = calc_bounding_rect(debug_image, hand_landmarks)
-                    # Landmark calculation
                     landmark_list = calc_landmark_list(debug_image, hand_landmarks)
-
-                    # Conversion to relative coordinates / normalized coordinates
                     pre_processed_landmark_list = pre_process_landmark(landmark_list)
-
-                    # Write to the dataset file
-                    logging_csv(number, mode, pre_processed_landmark_list)
-
-                    # Hand sign classification
                     hand_sign_id = keypoint_classifier(pre_processed_landmark_list)
-
-                    # Finger gesture classification
-                    finger_gesture_id = 0
-
-                    # Drawing part
-                    debug_image = draw_bounding_rect(use_brect, debug_image, brect)
-                    debug_image = draw_landmarks(debug_image, landmark_list)
-                    debug_image = draw_info_text(
-                        debug_image,
-                        brect,
-                        handedness,
-                        keypoint_classifier_labels[hand_sign_id],
-                    )
-
+                    hand_sign_text = keypoint_classifier_labels[hand_sign_id]
+                    
+                    # ========= LETTER BUFFER =========
+                    if hand_sign_text != stable_gesture:
+                        stable_gesture = hand_sign_text
+                        gesture_start_time = now
+                        gesture_committed = False
+                    elif not gesture_committed and (now - gesture_start_time) >= STABLE_TIME:
+                        current_text += hand_sign_text
+                        gesture_committed = True
+                        print("Buffered:", current_text)
+                    # ====================================
+                debug_image = draw_bounding_rect(use_brect, debug_image, brect)
+                debug_image = draw_landmarks(debug_image, landmark_list)
+                debug_image = draw_info_text(debug_image, brect, handedness, hand_sign_text)
+            # =========================== SEND TEXT ===========================
+            if (not results.multi_hand_landmarks and time.time() - last_hand_time > NO_HAND_TIMEOUT) \
+                or len(current_text) >= MAX_CHARS:
+                if current_text:
+                    print("Sending word:", current_text)
+                    send_result_to_esp32(current_text)
+                    current_text = ""
+                stable_gesture = None
+                gesture_committed = False 
+             # ================================================================
             debug_image = draw_info(debug_image, fps, mode, number)
 
             # Screen reflection #############################################################
@@ -583,10 +632,23 @@ def draw_bounding_rect(use_brect, image, brect):
 
 
 def draw_info_text(image, brect, handedness, hand_sign_text):
+#    global last_detected_gesture, gesture_start_time, last_sent_gesture
     cv.rectangle(image, (brect[0], brect[1]), (brect[2], brect[1] - 22), (0, 0, 0), -1)
 
     info_text = handedness.classification[0].label[0:]
     if hand_sign_text != "":
+#      now = time.time()
+#       
+#       # New gesture appeared → reset timer
+#       if hand_sign_text != last_detected_gesture:
+#           last_detected_gesture = hand_sign_text
+#           gesture_start_time = now
+#           
+#           # Same gesture held long enough → send once
+#       elif (now - gesture_start_time) >= STABLE_TIME:
+#           if hand_sign_text != last_sent_gesture:
+#               send_result_to_esp32(hand_sign_text)
+#               last_sent_gesture = hand_sign_text
         info_text = info_text + ":" + hand_sign_text
     cv.putText(
         image,
