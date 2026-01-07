@@ -14,13 +14,13 @@ from utils.cvfpscalc import CvFpsCalc
 from model.keypoint_classifier.keypoint_classifier import KeyPointClassifier
 
 #using ESP32 cam for video capture using camwebserver example from library
-ESP32_IP = "192.168.10.166"  # ESP32 cam IP for cam
+ESP32_IP = "192.168.97.81"  # ESP32 cam IP for cam
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-ESP32_UDP = ("192.168.10.166", 3333) # ESP32 UDP IP + UDP port
+ESP32_UDP = ("192.168.97.81", 3333) # ESP32 UDP IP + UDP port
 STREAM_TIMEOUT = 2.0  # seconds without a frame
 STABLE_TIME = 0.7  # seconds gesture must stay stable
 NO_HAND_TIMEOUT = 1.5  # seconds with no visible hands before sending
-MAX_CHARS = 20  # Maximum characters before it force sends
+MAX_CHARS = 20  # Maximum characters before it force sends (20 seems like a good enough lenght)
 
 
 datasetdir = "model/dataset/dataset 1"
@@ -57,11 +57,8 @@ def send_result_to_esp32(gesture_text):
     except:
         pass
 
-def open_stream():#takes the esp32 cam stream as visual input
-    cap = cv.VideoCapture(
-        f"http://{ESP32_IP}:81/stream",
-        cv.CAP_FFMPEG
-    )
+def open_stream():# opens the esp32 cam stream
+    cap = cv.VideoCapture(f"http://{ESP32_IP}:81/stream",cv.CAP_FFMPEG)
     cap.set(cv.CAP_PROP_BUFFERSIZE, 2)
     return cap
 
@@ -87,10 +84,8 @@ def main():
 
     use_brect = True
 
-    # Camera preparation ###############################################################
-    cap = cv.VideoCapture(f"http://{ESP32_IP}:81/stream")
-    cap.set(cv.CAP_PROP_BUFFERSIZE, 1)
-
+    # Initial Camera preparation ###############################################################
+    cap = open_stream()
     # Model load #############################################################
     mp_hands = mp.solutions.hands
     hands = mp_hands.Hands(
@@ -632,23 +627,10 @@ def draw_bounding_rect(use_brect, image, brect):
 
 
 def draw_info_text(image, brect, handedness, hand_sign_text):
-#    global last_detected_gesture, gesture_start_time, last_sent_gesture
     cv.rectangle(image, (brect[0], brect[1]), (brect[2], brect[1] - 22), (0, 0, 0), -1)
 
     info_text = handedness.classification[0].label[0:]
     if hand_sign_text != "":
-#      now = time.time()
-#       
-#       # New gesture appeared → reset timer
-#       if hand_sign_text != last_detected_gesture:
-#           last_detected_gesture = hand_sign_text
-#           gesture_start_time = now
-#           
-#           # Same gesture held long enough → send once
-#       elif (now - gesture_start_time) >= STABLE_TIME:
-#           if hand_sign_text != last_sent_gesture:
-#               send_result_to_esp32(hand_sign_text)
-#               last_sent_gesture = hand_sign_text
         info_text = info_text + ":" + hand_sign_text
     cv.putText(
         image,
